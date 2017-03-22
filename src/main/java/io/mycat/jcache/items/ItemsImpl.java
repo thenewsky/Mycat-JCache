@@ -1,6 +1,7 @@
 package io.mycat.jcache.items;
 
 import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Array;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -13,6 +14,11 @@ import org.slf4j.LoggerFactory;
 import io.mycat.jcache.context.JcacheContext;
 import io.mycat.jcache.context.Stats;
 import io.mycat.jcache.context.StatsState;
+import io.mycat.jcache.crawler.Crawler;
+import io.mycat.jcache.crawler.CrawlerExpiredData;
+import io.mycat.jcache.crawler.CrawlerImpl;
+import io.mycat.jcache.crawler.CrawlerResultType;
+import io.mycat.jcache.crawler.CrawlerstatsT;
 import io.mycat.jcache.enums.ItemFlags;
 import io.mycat.jcache.enums.LRU_TYPE_MAP;
 import io.mycat.jcache.memory.Slabs;
@@ -50,12 +56,16 @@ public class ItemsImpl implements Items{
 	
 	private static volatile int do_run_lru_maintainer_thread = 0;
 	private static int lru_maintainer_initialized = 0;
-	private static int lru_maintainer_check_clsid = 0;
+	private int lru_maintainer_check_clsid = 0;
 	
 	private static AtomicBoolean lru_maintainer_lock = new AtomicBoolean(false);
 	private static AtomicBoolean cas_id_lock = new AtomicBoolean(false);
 	private static AtomicBoolean stats_sizes_lock = new AtomicBoolean(false);
-
+	//每次循环执行之后最大延时时间
+	private static long MAX_LRU_MAINTAINER_SLEEP = 1000000;
+	//每次循环执行之后最小延时时间
+	private static long MIN_LRU_MAINTAINER_SLEEP = 1000;
+	
 	
 	private static  AtomicLong casIdGeneraytor = new AtomicLong();
 	
@@ -119,7 +129,13 @@ public class ItemsImpl implements Items{
 	    /* This is a race in order to simplify lru_pull_tail; in cases where
 	     * locked items are on the tail, you want them to fall out and cause
 	     * occasional OOM's, rather than internally work around them.
-	     * This also gives one fewer code path for slab alloc/free
+	     * This also gives one fewer code path for slames? or a number of times
+	     * based on how many chunks the new object should take up?
+	     * or based on the size of an object lru_pull_tail() says it evicted?
+	     * This is a classical GC problem if "large items" are of too varying of
+	     * sizes. This is actually okay here since the larger the data, the more
+	     * bandwidth it takes, the more time we can loop in comparison to serving
+	     * and replacing small items.b alloc/free
 	     */
 	    /* TODO: if power_largest, try a lot more times? or a number of times
 	     * based on how many chunks the new object should take up?
@@ -214,6 +230,7 @@ public class ItemsImpl implements Items{
 			ItemUtil.setExpTime(it, exptime);
 			byte[] suffixBytes = suffixStr.getBytes(JcacheGlobalConfig.defaultCahrset);
 			ItemUtil.setSuffix(it, suffixBytes);
+			ItemUtil.getSuffix(it);
 			ItemUtil.setNsuffix(it, (byte)suffixBytes.length);
 			if((flag&ItemFlags.ITEM_CHUNKED.getFlags())>0){
 				long chunk = ItemUtil.ITEM_data(it);
@@ -564,6 +581,180 @@ public class ItemsImpl implements Items{
 		itemstats[i][ItemStatsUtil.crawler_items_checked] += checked;
 	}
 
+
+	
+	@Override
+	public void do_item_unlink_nolock(long addr,long hv){
+		byte flags = ItemUtil.getItflags(addr);
+		if((flags & ItemFlags.ITEM_LINKED.getFlags())!=0){
+			ItemUtil.setItflags(addr, (byte)(ItemUtil.getItflags(addr)&~ItemFlags.ITEM_LINKED.getFlags()));
+			StatsState.curr_bytes.addAndGet(-ItemUtil.ITEM_ntotal(addr));
+			StatsState.curr_items.decrementAndGet();
+			item_stats_sizes_remove(addr);
+			JcacheContext.getAssoc()
+						 .assoc_delete(ItemUtil.getKey(addr),
+					                   ItemUtil.getNskey(addr),
+					                   hv);
+			do_item_unlink_q(addr);
+			do_item_remove(addr);
+		}
+	}
+
+	/* Copy/paste to avoid adding two extra branches for all common calls, since
+ 	* _nolock is only used in an uncommon case where we want to relink. */
+	@Override
+	public void do_item_update_nolock(long addr){
+			if(ItemUtil.getTime(addr)<System.currentTimeMillis()-Settings.ITEM_UPDATE_INTERVAL){
+				if((ItemUtil.getItflags(addr)&ItemFlags.ITEM_SLABBED.getFlags())!=0) return;
+				
+				if ((ItemUtil.getItflags(addr) & ItemFlags.ITEM_LINKED.getFlags()) != 0) {
+					do_item_unlink_q(addr);
+					ItemUtil.setTime(addr,System.currentTimeMillis());
+					do_item_link_q(addr);
+				}
+			}
+	}
+
+	/* Bump the last accessed time, or relink if we're in compat mode */
+	@Override
+	public void do_item_update(long addr) {
+		if(ItemUtil.getTime(addr)<System.currentTimeMillis()-Settings.ITEM_UPDATE_INTERVAL){
+			if((ItemUtil.getItflags(addr)&ItemFlags.ITEM_SLABBED.getFlags())!=0) return;
+			
+			if ((ItemUtil.getItflags(addr) & ItemFlags.ITEM_LINKED.getFlags()) != 0) {
+				ItemUtil.setTime(addr,System.currentTimeMillis());
+				if (!Settings.lruMaintainerThread) {
+					item_unlink_q(addr);
+					item_link_q(addr);
+				}
+			}
+		}
+	}
+
+	private void item_unlink_q(long addr) {
+		int clsid = ItemUtil.getSlabsClsid(addr);
+		AtomicBoolean lru_locks = JcacheContext.getLRU_Lock(clsid);
+		while(!lru_locks.compareAndSet(false, true)){}
+		try {
+			do_item_unlink_q(addr);
+		} finally {
+			lru_locks.lazySet(false);
+		}
+	}
+	
+	private void do_item_unlink_q(long addr){
+		int scid = ItemUtil.getSlabsClsid(addr);
+		long head = heads[scid];
+		long tail = tails[scid];
+		
+		if(head==addr){
+			heads[scid] = ItemUtil.getNext(addr);
+		}
+		
+		if(tail==addr){
+			tails[scid] = ItemUtil.getPrev(addr);
+		}
+		
+		long prev = ItemUtil.getPrev(addr);
+		long next = ItemUtil.getNext(addr);
+		
+		if(next>0) ItemUtil.setPrev(next, ItemUtil.getPrev(addr));
+		if(prev>0) ItemUtil.setNext(prev, ItemUtil.getNext(addr));
+		sizes[scid].decrementAndGet();
+		sizes_bytes[scid].addAndGet(-ItemUtil.ITEM_ntotal(addr));
+	}
+
+	@Override
+	public void do_item_unlink(long addr,long hv){
+		byte flags = ItemUtil.getItflags(addr);
+		if((flags&ItemFlags.ITEM_LINKED.getFlags())!=0){
+			ItemUtil.setItflags(addr, (byte)(flags&~ItemFlags.ITEM_LINKED.getFlags()));
+
+			StatsState.curr_bytes.addAndGet(-ItemUtil.ITEM_ntotal(addr));
+			StatsState.curr_items.decrementAndGet();
+			
+			item_stats_sizes_remove(addr);
+			if(logger.isDebugEnabled()){
+				logger.debug("do_item_replace do_item_unlink assoc_delete begin: {}  hv : {}", addr,hv);
+			}
+			JcacheContext.getAssoc()
+			 			 .assoc_delete(ItemUtil.getKey(addr),
+			 					       ItemUtil.getNskey(addr),
+			 					       hv);
+			if(logger.isDebugEnabled()){
+				logger.debug("do_item_replace do_item_unlink item_unlink_q begin: {}  hv : {}", addr,hv);
+			}
+			
+			item_unlink_q(addr);
+			if(logger.isDebugEnabled()){
+				logger.debug("do_item_replace do_item_unlink item_unlink_q end : {}  hv : {}", addr,hv);
+			}
+			do_item_remove(addr);
+		}
+	}
+	
+	@Override
+	public void item_stats_sizes_add(long it){
+	    if (stats_sizes_hist == 0 || stats_sizes_cas_min > ItemUtil.ITEM_get_cas(it))
+	        return;
+	    int ntotal = ItemUtil.ITEM_ntotal(it);
+	    int bucket = ntotal / 32;
+	    if ((ntotal % 32) != 0) bucket++;
+	    if (bucket < stats_sizes_buckets) {
+	    	UnSafeUtil.unsafe.getAndAddInt(null, getStats_sizes_hist(bucket), 1);
+	    };
+	}
+	
+	/* I think there's no way for this to be accurate without using the CAS value.
+	 * Since items getting their time value bumped will pass this validation.
+	 */
+	@Override
+	public void item_stats_sizes_remove(long it){
+	    if (stats_sizes_hist == 0 || stats_sizes_cas_min > ItemUtil.ITEM_get_cas(it))
+	        return;
+	    int ntotal = ItemUtil.ITEM_ntotal(it);
+	    int bucket = ntotal / 32;
+	    if ((ntotal % 32) != 0) bucket++;
+	    if (bucket < stats_sizes_buckets){
+	    	UnSafeUtil.unsafe.getAndAddInt(null, getStats_sizes_hist(bucket), -1);
+	    }
+	}
+	
+	@Override
+	public boolean item_stats_sizes_status(){
+		boolean ret = false;
+		while(!stats_sizes_lock.compareAndSet(false, true)){}
+		try {
+			if(stats_sizes_hist!=0){
+				ret = true;
+			}
+		} finally {
+			stats_sizes_lock.lazySet(false);
+		}
+		return ret;
+	}
+
+	@Override
+	public boolean do_item_replace(long oldAddr,long newAddr,long hv){
+		
+		byte itflags = ItemUtil.getItflags(oldAddr);
+		if((itflags&ItemFlags.ITEM_SLABBED.getFlags())!=0)  return false;
+		if(logger.isDebugEnabled()){
+			logger.debug("do_item_replace do_item_unlink begin : {}  newAddr : {}", oldAddr,newAddr);
+		}
+		do_item_unlink(oldAddr,hv);
+		if(logger.isDebugEnabled()){
+			logger.debug("do_item_replace do_item_unlink end : {}  newAddr : {}", oldAddr,newAddr);
+		}
+		return  do_item_link(newAddr, hv);
+	}
+
+	@Override
+	public long item_cachedump(int slabs_clsid, int limit, long bytes) {
+		// TODO Auto-generated method stub
+		return 0;
+	}
+	
     /*** LRU MAINTENANCE THREAD
 	 * Returns number of items remove, expired, or evicted.
      * Callable from worker threads or the LRU maintainer thread
@@ -737,207 +928,241 @@ public class ItemsImpl implements Items{
 		
 		return removed;
 	}
-	
-	@Override
-	public void do_item_unlink_nolock(long addr,long hv){
-		byte flags = ItemUtil.getItflags(addr);
-		if((flags & ItemFlags.ITEM_LINKED.getFlags())!=0){
-			ItemUtil.setItflags(addr, (byte)(ItemUtil.getItflags(addr)&~ItemFlags.ITEM_LINKED.getFlags()));
-			StatsState.curr_bytes.addAndGet(-ItemUtil.ITEM_ntotal(addr));
-			StatsState.curr_items.decrementAndGet();
-			item_stats_sizes_remove(addr);
-			JcacheContext.getAssoc()
-						 .assoc_delete(ItemUtil.getKey(addr),
-					                   ItemUtil.getNskey(addr),
-					                   hv);
-			do_item_unlink_q(addr);
-			do_item_remove(addr);
-		}
-	}
 
-	/* Copy/paste to avoid adding two extra branches for all common calls, since
- 	* _nolock is only used in an uncommon case where we want to relink. */
-	@Override
-	public void do_item_update_nolock(long addr){
-			if(ItemUtil.getTime(addr)<System.currentTimeMillis()-Settings.ITEM_UPDATE_INTERVAL){
-				if((ItemUtil.getItflags(addr)&ItemFlags.ITEM_SLABBED.getFlags())!=0) return;
-				
-				if ((ItemUtil.getItflags(addr) & ItemFlags.ITEM_LINKED.getFlags()) != 0) {
-					do_item_unlink_q(addr);
-					ItemUtil.setTime(addr,System.currentTimeMillis());
-					do_item_link_q(addr);
-				}
-			}
-	}
-
-	/* Bump the last accessed time, or relink if we're in compat mode */
-	@Override
-	public void do_item_update(long addr) {
-		if(ItemUtil.getTime(addr)<System.currentTimeMillis()-Settings.ITEM_UPDATE_INTERVAL){
-			if((ItemUtil.getItflags(addr)&ItemFlags.ITEM_SLABBED.getFlags())!=0) return;
-			
-			if ((ItemUtil.getItflags(addr) & ItemFlags.ITEM_LINKED.getFlags()) != 0) {
-				ItemUtil.setTime(addr,System.currentTimeMillis());
-				if (!Settings.lruMaintainerThread) {
-					item_unlink_q(addr);
-					item_link_q(addr);
-				}
-			}
-		}
-	}
-
-	private void item_unlink_q(long addr) {
-		int clsid = ItemUtil.getSlabsClsid(addr);
-		AtomicBoolean lru_locks = JcacheContext.getLRU_Lock(clsid);
-		while(!lru_locks.compareAndSet(false, true)){}
-		try {
-			do_item_unlink_q(addr);
-		} finally {
-			lru_locks.lazySet(false);
-		}
-	}
-	
-	private void do_item_unlink_q(long addr){
-		int scid = ItemUtil.getSlabsClsid(addr);
-		long head = heads[scid];
-		long tail = tails[scid];
-		
-		if(head==addr){
-			heads[scid] = ItemUtil.getNext(addr);
-		}
-		
-		if(tail==addr){
-			tails[scid] = ItemUtil.getPrev(addr);
-		}
-		
-		long prev = ItemUtil.getPrev(addr);
-		long next = ItemUtil.getNext(addr);
-		
-		if(next>0) ItemUtil.setPrev(next, ItemUtil.getPrev(addr));
-		if(prev>0) ItemUtil.setNext(prev, ItemUtil.getNext(addr));
-		sizes[scid].decrementAndGet();
-		sizes_bytes[scid].addAndGet(-ItemUtil.ITEM_ntotal(addr));
-	}
-
-	@Override
-	public void do_item_unlink(long addr,long hv){
-		byte flags = ItemUtil.getItflags(addr);
-		if((flags&ItemFlags.ITEM_LINKED.getFlags())!=0){
-			ItemUtil.setItflags(addr, (byte)(flags&~ItemFlags.ITEM_LINKED.getFlags()));
-
-			StatsState.curr_bytes.addAndGet(-ItemUtil.ITEM_ntotal(addr));
-			StatsState.curr_items.decrementAndGet();
-			
-			item_stats_sizes_remove(addr);
-			if(logger.isDebugEnabled()){
-				logger.debug("do_item_replace do_item_unlink assoc_delete begin: {}  hv : {}", addr,hv);
-			}
-			JcacheContext.getAssoc()
-			 			 .assoc_delete(ItemUtil.getKey(addr),
-			 					       ItemUtil.getNskey(addr),
-			 					       hv);
-			if(logger.isDebugEnabled()){
-				logger.debug("do_item_replace do_item_unlink item_unlink_q begin: {}  hv : {}", addr,hv);
-			}
-			
-			item_unlink_q(addr);
-			if(logger.isDebugEnabled()){
-				logger.debug("do_item_replace do_item_unlink item_unlink_q end : {}  hv : {}", addr,hv);
-			}
-			do_item_remove(addr);
-		}
-	}
-	
-	@Override
-	public void item_stats_sizes_add(long it){
-	    if (stats_sizes_hist == 0 || stats_sizes_cas_min > ItemUtil.ITEM_get_cas(it))
-	        return;
-	    int ntotal = ItemUtil.ITEM_ntotal(it);
-	    int bucket = ntotal / 32;
-	    if ((ntotal % 32) != 0) bucket++;
-	    if (bucket < stats_sizes_buckets) {
-	    	UnSafeUtil.unsafe.getAndAddInt(null, getStats_sizes_hist(bucket), 1);
-	    };
-	}
-	
-	/* I think there's no way for this to be accurate without using the CAS value.
-	 * Since items getting their time value bumped will pass this validation.
+	/**
+	 * lru线程实现类
+	 * @author Tommy
 	 */
-	@Override
-	public void item_stats_sizes_remove(long it){
-	    if (stats_sizes_hist == 0 || stats_sizes_cas_min > ItemUtil.ITEM_get_cas(it))
-	        return;
-	    int ntotal = ItemUtil.ITEM_ntotal(it);
-	    int bucket = ntotal / 32;
-	    if ((ntotal % 32) != 0) bucket++;
-	    if (bucket < stats_sizes_buckets){
-	    	UnSafeUtil.unsafe.getAndAddInt(null, getStats_sizes_hist(bucket), -1);
-	    }
-	}
+	class LruMaintainerThread implements Runnable {
+
+		@Override
+		public void run() {
+			int i;
+			//每次循环执行之后延时时间
+			long to_sleep = MIN_LRU_MAINTAINER_SLEEP;
+			long last_crawler_check = 0;
+			CrawlerExpiredData cdata = new CrawlerExpiredData();
+			cdata.crawl_complete = false;
+			if (Settings.verbose > 2)
+				logger.info("Starting LRU maintainer background thread");
+			//死循环,不断循环执行
+			while (do_run_lru_maintainer_thread!=0) {
+				int did_moves = 0;
+
+				while(!lru_maintainer_lock.compareAndSet(false, true)){}
+				try{
+					//每次while循环之后延迟执行时间
+					lru_maintainer_thread_warper.sleep(to_sleep);
+				}catch (InterruptedException e) {
+					logger.error("lru_maintainer_thread_warper sleep:{}",e);
+				}finally{
+					//解锁
+					lru_maintainer_lock.lazySet(false);
+				}
+				
+				Stats.lru_maintainer_juggles.incrementAndGet();
+				
+				//搜索源代码发现lru_maintainer_check_clsid一直都等于0
+		        //所以默认应该不会命中该if条件
+		        if (lru_maintainer_check_clsid != 0) {
+		            did_moves = lru_maintainer_juggle(lru_maintainer_check_clsid);
+		            lru_maintainer_check_clsid = 0;
+		        } else {
+		            //循环获取 slab id 然后依次调用
+		            for (i = Settings.POWER_SMALLEST; i < Settings.MAX_NUMBER_OF_SLAB_CLASSES; i++) {
+		                did_moves += lru_maintainer_juggle(i);
+		            }
+		        }
+				
+				if (did_moves == 0) {
+		            if (to_sleep < MAX_LRU_MAINTAINER_SLEEP)
+		                to_sleep += 1000;
+		        } else {
+		            to_sleep /= 2;
+		            if (to_sleep < MIN_LRU_MAINTAINER_SLEEP)
+		                to_sleep = MIN_LRU_MAINTAINER_SLEEP;
+		        }
+				
+				//判断是否开启了item爬虫线程
+				if (Settings.lru_crawler && last_crawler_check != Settings.current_time) {
+					//如果开启了则调用该函数执行,判断是否符合触发item爬虫线程条件
+		            //如果符合条件则触发信号
+					lru_maintainer_crawler_check(cdata);
+					last_crawler_check = Settings.current_time;
+		        }
+				
+			}
+			
+			if (Settings.verbose > 2)
+		        logger.info("LRU maintainer thread stopping");
+		}
+		
+	} 
+	
+	//lru实现类
+	LruMaintainerThread lru_maintainer_thread = new LruMaintainerThread();
+	//线程容器
+	Thread lru_maintainer_thread_warper;
+	
 	
 	@Override
-	public boolean item_stats_sizes_status(){
-		boolean ret = false;
-		while(!stats_sizes_lock.compareAndSet(false, true)){}
-		try {
-			if(stats_sizes_hist!=0){
-				ret = true;
-			}
-		} finally {
-			stats_sizes_lock.lazySet(false);
+	public int start_lru_maintainer_thread() {
+		int ret = 0;
+		//自旋转锁
+		while(!lru_maintainer_lock.compareAndSet(false, true)){}
+		try{
+			do_run_lru_maintainer_thread = 1;
+		    Settings.lruMaintainerThread = true;
+		    //开启lru主线程
+		    lru_maintainer_thread_warper.start();
+		    logger.info("Can't create LRU maintainer thread: {}",ret);
+		}finally{
+			//解锁
+			lru_maintainer_lock.lazySet(false);
 		}
 		return ret;
 	}
 
 	@Override
-	public boolean do_item_replace(long oldAddr,long newAddr,long hv){
-		
-		byte itflags = ItemUtil.getItflags(oldAddr);
-		if((itflags&ItemFlags.ITEM_SLABBED.getFlags())!=0)  return false;
-		if(logger.isDebugEnabled()){
-			logger.debug("do_item_replace do_item_unlink begin : {}  newAddr : {}", oldAddr,newAddr);
-		}
-		do_item_unlink(oldAddr,hv);
-		if(logger.isDebugEnabled()){
-			logger.debug("do_item_replace do_item_unlink end : {}  newAddr : {}", oldAddr,newAddr);
-		}
-		return  do_item_link(newAddr, hv);
-	}
-
-	@Override
-	public long item_cachedump(int slabs_clsid, int limit, long bytes) {
-		// TODO Auto-generated method stub
-		return 0;
-	}
-
-	@Override
-	public int start_lru_maintainer_thread() {
-		// TODO Auto-generated method stub
-		return 0;
-	}
-
-	@Override
 	public int stop_lru_maintainer_thread() {
-		// TODO Auto-generated method stub
-		return 0;
+		int ret = 0;
+		//自旋转锁
+		while(!lru_maintainer_lock.compareAndSet(false, true)){}
+		try{
+			do_run_lru_maintainer_thread = 0;
+		    Settings.lruMaintainerThread = false;
+		    //开启lru主线程
+		    lru_maintainer_thread_warper.stop();
+		    logger.info("Failed to stop LRU maintainer thread: {}",ret);
+		}finally{
+			//解锁
+			lru_maintainer_lock.lazySet(false);
+		}
+		return ret;
 	}
 
 	@Override
 	public int init_lru_maintainer() {
-		// TODO Auto-generated method stub
+		if (lru_maintainer_initialized == 0) {
+			lru_maintainer_thread_warper = new Thread(lru_maintainer_thread);
+	        lru_maintainer_initialized = 1;
+	    }
 		return 0;
 	}
 
 	@Override
 	public void lru_maintainer_pause() {
-		// TODO Auto-generated method stub
-		
+		while(!lru_maintainer_lock.compareAndSet(false, true)){}
 	}
 
 	@Override
 	public void lru_maintainer_resume() {
-		// TODO Auto-generated method stub
-		
+		lru_maintainer_lock.lazySet(true);
+	}
+
+	@Override
+	public void lru_maintainer_crawler_check(CrawlerExpiredData cdata ) {
+		 int i;
+		 long next_crawls[] = new long[Settings.MAX_NUMBER_OF_SLAB_CLASSES];
+		 long next_crawl_wait[] = new long[Settings.MAX_NUMBER_OF_SLAB_CLASSES];
+		 int todo[] = new int[Settings.MAX_NUMBER_OF_SLAB_CLASSES];
+		 boolean do_run = false;
+		 if ( !cdata.crawl_complete) {
+		     return;
+		 }
+		 
+		 for (i = Settings.POWER_SMALLEST; i < Settings.MAX_NUMBER_OF_SLAB_CLASSES; i++) {
+			 CrawlerstatsT s = cdata.crawlerstats[i];
+			 
+			 if (s.run_complete) {
+				while(!cdata.lock.compareAndSet(false, true)){}
+				try{
+					int x;
+					long possible_reclaims = s.seen - s.noexp;
+					long available_reclaims = 0;
+					long low_watermark = (possible_reclaims / 100) + 1;
+					long since_run = Settings.current_time - s.end_time;
+					for (x = 0; x < 60; x++) {
+			         	available_reclaims += s.histo[x];
+			         	if (available_reclaims > low_watermark) {
+			            	if (next_crawl_wait[i] < (x * 60)) {
+			            		next_crawl_wait[i] += 60;
+			             	} else if (next_crawl_wait[i] >= 60) {
+			                	next_crawl_wait[i] -= 60;
+			             	}
+			            	break;
+			           }
+			        }
+					
+					if (available_reclaims == 0) {
+		                next_crawl_wait[i] += 60;
+		            }
+					
+					if (next_crawl_wait[i] > Settings.MAX_MAINTCRAWL_WAIT) {
+			            next_crawl_wait[i] = Settings.MAX_MAINTCRAWL_WAIT;
+			        }
+
+			       	next_crawls[i] = Settings.current_time + next_crawl_wait[i] + 5;
+					
+			       	//日志
+			       	logger.warn("i:{},low_watermark:{},available_reclaims:{},since_run:{},"
+			       			+ "next_crawls:{},time:{},seen:{},reclaimed{}"
+			       			, i,  low_watermark, available_reclaims,
+		                     since_run, next_crawls[i] - Settings.current_time,
+		                    s.end_time - s.start_time, s.seen, s.reclaimed);
+			       	
+					s.run_complete = false;
+				}finally{
+					//解锁
+					cdata.lock.lazySet(false);
+				}
+				
+			 }
+			 
+			 if (Settings.current_time > next_crawls[i]) {
+				 todo[i] = 1;
+		         do_run = true;
+		         next_crawls[i] = Settings.current_time + 5; // minimum retry wait.
+		     }
+			 
+		 }
+		 if (do_run) {
+			 Crawler crawler = new CrawlerImpl();
+			 crawler.lru_crawler_start(todo, 0,CrawlerResultType.CRAWLER_EXPIRED,cdata, 0L, 0);
+		 }
+	}
+
+	@Override
+	public int lru_maintainer_juggle(int slabs_clsid) {
+		int i;
+	    int did_moves = 0;
+	    boolean mem_limit_reached = false;
+	    long total_bytes = 0L;
+	    int chunks_perslab = 0;
+	    int chunks_free = 0;
+//	    chunks_free = slabs_available_chunks(slabs_clsid, &mem_limit_reached,
+//	            &total_bytes, &chunks_perslab);
+	    if (Settings.expirezero_does_not_evict)
+	        total_bytes -= noexp_lru_size(slabs_clsid);
+	    
+	    if (Settings.slab_automove > 0 && chunks_free > (chunks_perslab * 2.5)) {
+//	        slabs_reassign(slabs_clsid, Settings.SLAB_GLOBAL_PAGE_POOL);
+	    }
+	    
+	    /* Juggle HOT/WARM up to N times */
+	    for (i = 0; i < 1000; i++) {
+	        int do_more = 0;
+	        if (lru_pull_tail(slabs_clsid, LRU_TYPE_MAP.HOT_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS) > 0 ||
+	            lru_pull_tail(slabs_clsid, LRU_TYPE_MAP.WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS) > 0) {
+	            do_more++;
+	        }
+	        do_more += lru_pull_tail(slabs_clsid, LRU_TYPE_MAP.COLD_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS);
+	        if (do_more == 0)
+	            break;
+	        did_moves++;
+	    }
+	    
+	    return did_moves;
 	}
 
 }

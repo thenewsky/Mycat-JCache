@@ -162,7 +162,7 @@ public interface BinaryCommand extends Command{
 	 * @param status
 	 * @param cas
 	 */
-	public default void writeResponse(Connection conn,byte opcode,short status,long cas){
+	public default  void writeResponse(Connection conn,byte opcode,short status,long cas){
 		int totallen = BinaryProtocol.memcache_packetHeaderSize;
 		ByteBuffer write = ByteBuffer.allocate(totallen);
 		write.put(ProtocolMagic.PROTOCOL_BINARY_RES.getByte());

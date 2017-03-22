@@ -7,7 +7,9 @@ import java.nio.channels.CancelledKeyException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -60,7 +62,6 @@ public class Connection implements Closeable, Runnable {
     private long item;
     private int rlbytes;/* how many bytes to swallow */  
     
-    
     /**
      * 二进制请求头
      */
@@ -83,8 +84,8 @@ public class Connection implements Closeable, Runnable {
         if (ioHandler != null) {
             ioHandler.onConnected(this);
         }
-        writeBuffer.put("Welcome Mycat-JCache ...\r\nJCache>".getBytes());
-        enableWrite(true);
+//        writeBuffer.put("Welcome Mycat-JCache ...\r\nJCache>".getBytes());
+//        enableWrite(true);
     }
 
     @Override
@@ -102,11 +103,12 @@ public class Connection implements Closeable, Runnable {
     	    		   state = CONN_STATES.conn_read;
     	    		   stop = true;
     	    		   break;
-    	    	   case conn_nread:  //  文本命令会进入到 nread 状态  读取 value 部分. 不需要解析命令了。
+    	    	   case conn_nread:  //  文本命令 telnet 会进入到该状态
     	    		   selectionKey.interestOps(selectionKey.interestOps() | SelectionKey.OP_READ);
     	    		   res = try_read_network();
     	    		   switch(res){
 	    	    		   case READ_NO_DATA_RECEIVED:
+	    	    			   stop = true;
 	    	    			   break;
 	    	    		   case READ_DATA_RECEIVED:   /* 数据读取完成,开始 处理value 部分 */
 	    	    			   ioHandler.doReadHandler(this);
@@ -139,8 +141,6 @@ public class Connection implements Closeable, Runnable {
     	    	   case conn_parse_cmd:
     	    		   if(!try_read_command()){
     	    			   state = CONN_STATES.conn_waiting;
-    	    		   }else{
-    	    			   setLastMessagePos(readBuffer.position());
     	    		   }
     	    		   break;
     	    	   case conn_new_cmd:
@@ -342,16 +342,6 @@ public class Connection implements Closeable, Runnable {
         try {
             SelectionKey key = this.selectionKey;
             key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
-//            logger.warn("disable write con " + this);
-        } catch (Exception e) {
-            logger.warn("can't disable write " + e + " con " + this);
-        }
-    }
-
-    public void disableRead() {
-        try {
-            SelectionKey key = this.selectionKey;
-            key.interestOps(key.interestOps() & ~SelectionKey.OP_READ);
 //            logger.warn("disable write con " + this);
         } catch (Exception e) {
             logger.warn("can't disable write " + e + " con " + this);

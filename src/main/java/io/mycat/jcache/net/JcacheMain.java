@@ -54,6 +54,8 @@ public class JcacheMain
     private static int maxcore = 0;
     private static String username;
     private static String pid_file;
+    
+    static int lru_crawler_initialized = 0;
 	/**
 	 * 主线程 将新连接分派给 reactor 的策略
 	 */
@@ -61,18 +63,20 @@ public class JcacheMain
 	
 	public static void main( String[] args ) throws IOException 
     {	
-    	
+    	/**
+    	 * reactor模型初始化
+    	 */
     	initReactorStrategy();
     	/**
     	 * 后期可能变更为从环境变量获取
     	 */
     	ConfigLoader.loadProperties(null);
     	
-        /* Run regardless of initializing it later */
+        /* lru爬出初始化 */
         init_lru_crawler();
         init_lru_maintainer();
     	
-    	/* process arguments */
+    	/* 获取程序参数 */
         if(args.length > 0){
         	initGlobalConfig(args);
         }
@@ -145,8 +149,11 @@ public class JcacheMain
 		//TODO
 	}
     
-    private static void init_lru_crawler(){
-    	//TODO
+    private static int init_lru_crawler(){
+    	if (lru_crawler_initialized == 0) {
+            lru_crawler_initialized = 1;
+        }
+        return 0;
     }
     
     private static void init_lru_maintainer(){
@@ -229,7 +236,7 @@ public class JcacheMain
     	String[] commandLineparams = tmpparams.split("-");
     	
     	IntStream.range(0, commandLineparams.length).forEach(i->{
-    		String[] params = commandLineparams[i].split(" ");
+    		String[] params = commandLineparams[i].split("\\s+");
     		switch (params[0]) {
     		case "":
     			break;
